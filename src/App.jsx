@@ -3,25 +3,28 @@ import { initializeApp } from 'firebase/app';
 import { 
   getAuth, 
   signInAnonymously, 
-  signInWithCustomToken,
   onAuthStateChanged 
 } from 'firebase/auth';
 import { 
   getFirestore, 
   doc, 
   setDoc, 
-  onSnapshot
+  onSnapshot,
+  enableIndexedDbPersistence,
+  initializeFirestore,
+  CACHE_SIZE_UNLIMITED
 } from 'firebase/firestore';
 import { 
   Music, 
   Check, 
   Loader2, 
   WifiOff,
-  Trophy
+  Trophy,
+  Zap
 } from 'lucide-react';
 
-// --- НАСТРОЙКИ FIREBASE ДЛЯ "SoundPool Online" ---
-// 1. Скопируйте ключи из консоли Firebase (Project Settings -> Your apps)
+// --- НАСТРОЙКИ FIREBASE ---
+// 1. Скопируйте ключи из консоли Firebase
 // 2. Вставьте их ВМЕСТО объекта ниже:
 
 const firebaseConfig = {
@@ -34,20 +37,31 @@ const firebaseConfig = {
 };
 
 // --- ИНИЦИАЛИЗАЦИЯ ---
-// Если ключи не вставлены, приложение не запустится
 let auth, db;
 try {
-  // Проверяем, не забыли ли вы заменить заглушку
+  // Проверка на заглушку
   if (firebaseConfig.apiKey !== "ВСТАВЬТЕ_СЮДА_ВАШ_API_KEY") {
     const app = initializeApp(firebaseConfig);
     auth = getAuth(app);
-    db = getFirestore(app);
+    
+    // Инициализируем базу с поддержкой кэша (для скорости)
+    db = initializeFirestore(app, {
+      cacheSizeBytes: CACHE_SIZE_UNLIMITED
+    });
+
+    // Пытаемся включить оффлайн-режим (чтобы работало мгновенно во второй раз)
+    enableIndexedDbPersistence(db).catch((err) => {
+      if (err.code == 'failed-precondition') {
+        console.log('Нельзя открыть несколько вкладок сразу');
+      } else if (err.code == 'unimplemented') {
+        console.log('Браузер не поддерживает оффлайн');
+      }
+    });
   }
 } catch (e) {
   console.error("Ошибка инициализации Firebase:", e);
 }
 
-// Уникальный ID сессии голосования
 const appId = 'soundpool-online-session-1';
 
 // --- СПИСОК ТРЕКОВ ---
@@ -73,14 +87,16 @@ const TRACKS = [
 
 const PERSONAS = ['Артур Крылов', 'Артур Евсеенко', 'Егор Кучепатов'];
 
-// --- ГЛАВНЫЙ КОМПОНЕНТ ---
 export default function App() {
   const [user, setUser] = useState(null);
   const [selectedPersona, setSelectedPersona] = useState(null);
-  const [isLoading, setIsLoading] = useState(true);
+  
+  // Разделяем загрузку: авторизация (быстро) и данные (медленно)
+  const [isAuthReady, setIsAuthReady] = useState(false);
+  const [isDataReady, setIsDataReady] = useState(false);
+  
   const [error, setError] = useState(null);
   
-  // Данные из облака
   const [cloudData, setCloudData] = useState({
     votes: {
       "Артур Крылов": [],
@@ -91,10 +107,8 @@ export default function App() {
 
   // 1. АВТОРИЗАЦИЯ
   useEffect(() => {
-    // Проверка, вставил ли пользователь ключи
     if (!auth || firebaseConfig.apiKey === "ВСТАВЬТЕ_СЮДА_ВАШ_API_KEY") {
-      setError("Ошибка: Вы не вставили ключи Firebase в файл App.jsx (строки 23-30)");
-      setIsLoading(false);
+      setError("Ключи не вставлены в App.jsx!");
       return;
     }
 
@@ -103,24 +117,26 @@ export default function App() {
         await signInAnonymously(auth);
       } catch (err) {
         console.error("Auth error:", err);
-        setError("Ошибка входа в систему Firebase. Проверьте ключи.");
+        setError("Ошибка входа.");
       }
     };
 
     initAuth();
-    const unsubscribe = onAuthStateChanged(auth, (u) => setUser(u));
+    const unsubscribe = onAuthStateChanged(auth, (u) => {
+      setUser(u);
+      setIsAuthReady(true); // Как только вошли - убираем лоадер
+    });
     return () => unsubscribe();
   }, []);
 
-  // 2. СИНХРОНИЗАЦИЯ С БАЗОЙ
+  // 2. ДАННЫЕ (Фоновая загрузка)
   useEffect(() => {
     if (!user || !db) return;
 
-    // Путь к документу в базе данных
     const docRef = doc(db, 'projects', 'soundpool', 'sessions', appId);
 
     const unsubscribe = onSnapshot(docRef, (snapshot) => {
-      setIsLoading(false);
+      setIsDataReady(true); // Данные пришли
       if (snapshot.exists()) {
         const data = snapshot.data();
         setCloudData(prev => ({
@@ -131,19 +147,14 @@ export default function App() {
       }
     }, (err) => {
       console.error("Snapshot error:", err);
-      // Если ошибка прав доступа, пробуем создать документ или сообщаем пользователю
-      if (err.code === 'permission-denied') {
-         setError("Нет прав доступа. Проверьте Firestore Rules (должно быть allow read, write: if true;)");
-      } else {
-         setError("Ошибка получения данных.");
-      }
-      setIsLoading(false);
+      // Не блокируем экран при ошибке данных, просто покажем 0
+      setIsDataReady(true); 
     });
 
     return () => unsubscribe();
   }, [user]);
 
-  // 3. ЛОГИКА ГОЛОСОВАНИЯ
+  // 3. ЛОГИКА
   const handleToggleVote = async (trackId) => {
     if (!user || !selectedPersona) return;
 
@@ -157,22 +168,26 @@ export default function App() {
       newVotes = [...currentVotes, trackId];
     }
 
+    // Оптимистичное обновление (сразу меняем цвет кнопки, не ждем интернета)
+    setCloudData(prev => ({
+      ...prev,
+      votes: {
+        ...prev.votes,
+        [selectedPersona]: newVotes
+      }
+    }));
+
     const docRef = doc(db, 'projects', 'soundpool', 'sessions', appId);
-    
     try {
-      // merge: true создаст документ и структуру папок, если их нет
       await setDoc(docRef, {
-        votes: {
-          [selectedPersona]: newVotes
-        }
+        votes: { [selectedPersona]: newVotes }
       }, { merge: true });
     } catch (err) {
       console.error("Save error:", err);
-      alert("Ошибка сохранения. Проверьте интернет.");
     }
   };
 
-  // 4. ПОДСЧЕТ ИТОГОВ
+  // 4. ИТОГИ
   const results = useMemo(() => {
     const counts = {};
     TRACKS.forEach(t => counts[t.id] = 0);
@@ -180,9 +195,7 @@ export default function App() {
     Object.values(cloudData.votes).forEach(userVotes => {
       if (Array.isArray(userVotes)) {
         userVotes.forEach(id => {
-          if (counts[id] !== undefined) {
-            counts[id]++;
-          }
+          if (counts[id] !== undefined) counts[id]++;
         });
       }
     });
@@ -198,26 +211,23 @@ export default function App() {
     return (
       <div className="min-h-screen bg-black flex flex-col items-center justify-center p-6 text-red-500 font-sans text-center">
         <WifiOff size={48} className="mb-4" />
-        <h2 className="text-xl font-bold mb-2">Настройка не завершена</h2>
-        <p className="text-sm opacity-80 mb-4">{error}</p>
-        <div className="bg-zinc-900 p-4 rounded text-left text-xs font-mono text-zinc-400 overflow-auto max-w-full">
-            const firebaseConfig = &#123;<br/>
-            &nbsp;&nbsp;apiKey: "..."<br/>
-            &#125;
-        </div>
+        <h2 className="text-xl font-bold mb-2">Ошибка</h2>
+        <p className="text-sm opacity-80">{error}</p>
       </div>
     );
   }
 
-  if (isLoading) {
+  // Показываем лоадер ТОЛЬКО пока идет авторизация (это быстро)
+  // Данные могут грузиться фоном
+  if (!isAuthReady) {
     return (
-      <div className="min-h-screen bg-black flex items-center justify-center text-orange-500">
+      <div className="min-h-screen bg-black flex items-center justify-center text-orange-600">
         <Loader2 className="animate-spin" size={48} />
       </div>
     );
   }
 
-  // ЭКРАН 1: ВЫБОР ПЕРСОНЫ
+  // ЭКРАН 1: ВЫБОР
   if (!selectedPersona) {
     return (
       <div className="min-h-screen bg-black text-white p-6 font-sans flex flex-col justify-center max-w-md mx-auto">
@@ -226,7 +236,9 @@ export default function App() {
             <Music size={40} className="text-white" />
           </div>
           <h1 className="text-3xl font-bold mb-2">SoundPool Online</h1>
-          <p className="text-zinc-500">Выберите себя, чтобы начать</p>
+          <p className="text-zinc-500">
+            {isDataReady ? "Выберите себя:" : "Соединение с сервером..."}
+          </p>
         </div>
 
         <div className="space-y-3">
@@ -240,10 +252,15 @@ export default function App() {
               >
                 <div className="flex justify-between items-center relative z-10">
                   <span className="font-bold text-lg group-hover:text-orange-400 transition-colors">{name}</span>
-                  {votesCount > 0 && (
-                    <span className="text-xs font-mono bg-zinc-800 px-2 py-1 rounded text-zinc-400">
-                      {votesCount} выбрано
-                    </span>
+                  
+                  {isDataReady ? (
+                    votesCount > 0 && (
+                      <span className="text-xs font-mono bg-zinc-800 px-2 py-1 rounded text-zinc-400 animate-in fade-in">
+                        {votesCount} выбрано
+                      </span>
+                    )
+                  ) : (
+                    <Loader2 size={16} className="text-zinc-600 animate-spin" />
                   )}
                 </div>
               </button>
@@ -260,7 +277,6 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-black text-white font-sans flex flex-col">
-      {/* HEADER */}
       <div className="sticky top-0 z-50 bg-black/90 backdrop-blur-md border-b border-zinc-900 px-4 py-3 flex justify-between items-center">
         <div className="flex items-center gap-3">
           <div className="w-8 h-8 rounded-full bg-orange-600 flex items-center justify-center text-xs font-bold shadow-lg shadow-orange-900/50">
@@ -269,7 +285,7 @@ export default function App() {
           <div className="leading-tight">
             <div className="font-bold text-sm">{selectedPersona}</div>
             <div className="text-[10px] text-green-500 flex items-center gap-1">
-              <span className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse"/> Online
+              <Zap size={10} fill="currentColor" /> Online
             </div>
           </div>
         </div>
@@ -283,7 +299,7 @@ export default function App() {
 
       <div className="flex-1 overflow-y-auto p-4 max-w-md mx-auto w-full pb-24">
         
-        {/* ИНФОБЛОК */}
+        {/* Статистика сверху */}
         <div className="grid grid-cols-3 gap-2 mb-6">
            {PERSONAS.map(p => {
              const count = (cloudData.votes[p] || []).length;
@@ -291,7 +307,13 @@ export default function App() {
              return (
                <div key={p} className={`bg-zinc-900/50 rounded-xl p-3 border text-center transition-all ${isMe ? 'border-orange-500/30 bg-orange-500/5' : 'border-zinc-800'}`}>
                  <div className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1 truncate">{p.split(' ')[0]}</div>
-                 <div className={`text-xl font-bold ${count > 0 ? 'text-white' : 'text-zinc-700'}`}>{count}</div>
+                 <div className="text-xl font-bold h-7 flex items-center justify-center">
+                   {isDataReady ? (
+                     <span className={count > 0 ? 'text-white' : 'text-zinc-700'}>{count}</span>
+                   ) : (
+                     <div className="w-4 h-4 rounded-full border-2 border-zinc-700 border-t-zinc-500 animate-spin" />
+                   )}
+                 </div>
                </div>
              )
            })}
@@ -301,7 +323,6 @@ export default function App() {
           <span className="text-orange-500">#</span> Треклист
         </h2>
 
-        {/* СПИСОК */}
         <div className="space-y-2 mb-8">
           {TRACKS.map(track => {
             const isSelected = myVotes.includes(track.id);
@@ -315,7 +336,7 @@ export default function App() {
                     : 'bg-zinc-900 text-zinc-400 border-zinc-800 hover:bg-zinc-800'
                 }`}
               >
-                <div className={`w-6 h-6 rounded-md flex items-center justify-center border-2 transition-all ${
+                <div className={`w-6 h-6 rounded-md flex items-center justify-center border-2 transition-all flex-shrink-0 ${
                   isSelected 
                     ? 'border-white bg-white text-orange-600' 
                     : 'border-zinc-700 group-hover:border-zinc-500 bg-transparent'
@@ -330,8 +351,7 @@ export default function App() {
           })}
         </div>
 
-        {/* ЖИВЫЕ РЕЗУЛЬТАТЫ */}
-        {totalVotes > 0 && (
+        {totalVotes > 0 && isDataReady && (
           <div className="bg-zinc-900 rounded-2xl p-5 border border-zinc-800 animate-in fade-in slide-in-from-bottom-4 duration-500">
             <h3 className="font-bold text-lg mb-4 flex items-center gap-2 text-white">
               <Trophy className="text-yellow-500" size={20} />
@@ -353,7 +373,6 @@ export default function App() {
                         style={{ width: `${(track.count / 3) * 100}%` }}
                       />
                     </div>
-                    {/* Аватарки тех, кто проголосовал */}
                     <div className="flex gap-1 mt-1.5">
                       {PERSONAS.map((p, idx) => {
                         if (cloudData.votes[p]?.includes(track.id)) {
@@ -376,5 +395,3 @@ export default function App() {
     </div>
   );
 }
-
-
