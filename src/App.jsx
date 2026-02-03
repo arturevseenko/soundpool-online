@@ -20,13 +20,14 @@ import {
   Loader2, 
   WifiOff,
   Trophy,
-  Zap
+  Zap,
+  ArrowRight,
+  RotateCcw,
+  Users
 } from 'lucide-react';
 
 // --- НАСТРОЙКИ FIREBASE ---
-// 1. Скопируйте ключи из консоли Firebase
-// 2. Вставьте их ВМЕСТО объекта ниже:
-
+// Вставьте ваши ключи сюда:
 const firebaseConfig = {
   apiKey: "AIzaSyD5Dhe2WQ1du8H6a1ayhzsCdg5eVEzlehM",
   authDomain: "soundpool-online.firebaseapp.com",
@@ -39,32 +40,18 @@ const firebaseConfig = {
 // --- ИНИЦИАЛИЗАЦИЯ ---
 let auth, db;
 try {
-  // Проверка на заглушку
   if (firebaseConfig.apiKey !== "ВСТАВЬТЕ_СЮДА_ВАШ_API_KEY") {
     const app = initializeApp(firebaseConfig);
     auth = getAuth(app);
-    
-    // Инициализируем базу с поддержкой кэша (для скорости)
-    db = initializeFirestore(app, {
-      cacheSizeBytes: CACHE_SIZE_UNLIMITED
-    });
-
-    // Пытаемся включить оффлайн-режим (чтобы работало мгновенно во второй раз)
-    enableIndexedDbPersistence(db).catch((err) => {
-      if (err.code == 'failed-precondition') {
-        console.log('Нельзя открыть несколько вкладок сразу');
-      } else if (err.code == 'unimplemented') {
-        console.log('Браузер не поддерживает оффлайн');
-      }
-    });
+    db = initializeFirestore(app, { cacheSizeBytes: CACHE_SIZE_UNLIMITED });
+    enableIndexedDbPersistence(db).catch(() => {});
   }
 } catch (e) {
-  console.error("Ошибка инициализации Firebase:", e);
+  console.error("Init error", e);
 }
 
 const appId = 'soundpool-online-session-1';
 
-// --- СПИСОК ТРЕКОВ ---
 const TRACKS = [
   { id: 101, title: 'Aldevaran (master)' },
   { id: 102, title: 'Anima (master)' },
@@ -85,313 +72,247 @@ const TRACKS = [
   { id: 117, title: 'Tallulah (master)' }
 ];
 
-const PERSONAS = ['Артур Крылов', 'Артур Евсеенко', 'Егор Кучепатов'];
+const PERSONAS = [
+  { name: 'Артур Крылов', initials: 'АК', color: 'bg-blue-500' },
+  { name: 'Артур Евсеенко', initials: 'АЕ', color: 'bg-purple-500' },
+  { name: 'Егор Кучепатов', initials: 'ЕК', color: 'bg-green-500' }
+];
 
 export default function App() {
   const [user, setUser] = useState(null);
   const [selectedPersona, setSelectedPersona] = useState(null);
-  
-  // Разделяем загрузку: авторизация (быстро) и данные (медленно)
+  const [view, setView] = useState('voting'); // 'voting' или 'results'
   const [isAuthReady, setIsAuthReady] = useState(false);
-  const [isDataReady, setIsDataReady] = useState(false);
-  
   const [error, setError] = useState(null);
   
   const [cloudData, setCloudData] = useState({
-    votes: {
-      "Артур Крылов": [],
-      "Артур Евсеенко": [],
-      "Егор Кучепатов": []
-    }
+    votes: { "Артур Крылов": [], "Артур Евсеенко": [], "Егор Кучепатов": [] }
   });
 
-  // 1. АВТОРИЗАЦИЯ
+  // Авторизация
   useEffect(() => {
-    if (!auth || firebaseConfig.apiKey === "ВСТАВЬТЕ_СЮДА_ВАШ_API_KEY") {
-      setError("Ключи не вставлены в App.jsx!");
-      return;
+    if (!auth || firebaseConfig.apiKey.includes("ВСТАВЬТЕ")) {
+      setError("Ключи не вставлены!"); return;
     }
-
-    const initAuth = async () => {
-      try {
-        await signInAnonymously(auth);
-      } catch (err) {
-        console.error("Auth error:", err);
-        setError("Ошибка входа.");
-      }
-    };
-
-    initAuth();
-    const unsubscribe = onAuthStateChanged(auth, (u) => {
-      setUser(u);
-      setIsAuthReady(true); // Как только вошли - убираем лоадер
-    });
-    return () => unsubscribe();
+    signInAnonymously(auth).catch(e => setError("Ошибка входа"));
+    return onAuthStateChanged(auth, (u) => { setUser(u); setIsAuthReady(true); });
   }, []);
 
-  // 2. ДАННЫЕ (Фоновая загрузка)
+  // Синхронизация данных
   useEffect(() => {
     if (!user || !db) return;
-
     const docRef = doc(db, 'projects', 'soundpool', 'sessions', appId);
-
-    const unsubscribe = onSnapshot(docRef, (snapshot) => {
-      setIsDataReady(true); // Данные пришли
-      if (snapshot.exists()) {
-        const data = snapshot.data();
-        setCloudData(prev => ({
-          ...prev,
-          ...data,
-          votes: { ...prev.votes, ...(data.votes || {}) }
-        }));
+    return onSnapshot(docRef, (snap) => {
+      if (snap.exists()) {
+        const data = snap.data();
+        setCloudData(prev => ({ ...prev, ...data, votes: { ...prev.votes, ...(data.votes || {}) } }));
       }
-    }, (err) => {
-      console.error("Snapshot error:", err);
-      // Не блокируем экран при ошибке данных, просто покажем 0
-      setIsDataReady(true); 
     });
-
-    return () => unsubscribe();
   }, [user]);
 
-  // 3. ЛОГИКА
+  // Логика голоса
   const handleToggleVote = async (trackId) => {
-    if (!user || !selectedPersona) return;
+    if (!selectedPersona) return;
+    const myName = selectedPersona.name;
+    const currentVotes = cloudData.votes[myName] || [];
+    const newVotes = currentVotes.includes(trackId) 
+      ? currentVotes.filter(id => id !== trackId)
+      : [...currentVotes, trackId];
 
-    const currentVotes = cloudData.votes[selectedPersona] || [];
-    const isSelected = currentVotes.includes(trackId);
-    
-    let newVotes;
-    if (isSelected) {
-      newVotes = currentVotes.filter(id => id !== trackId);
-    } else {
-      newVotes = [...currentVotes, trackId];
-    }
-
-    // Оптимистичное обновление (сразу меняем цвет кнопки, не ждем интернета)
+    // Оптимистичное обновление
     setCloudData(prev => ({
       ...prev,
-      votes: {
-        ...prev.votes,
-        [selectedPersona]: newVotes
-      }
+      votes: { ...prev.votes, [myName]: newVotes }
     }));
 
-    const docRef = doc(db, 'projects', 'soundpool', 'sessions', appId);
-    try {
-      await setDoc(docRef, {
-        votes: { [selectedPersona]: newVotes }
-      }, { merge: true });
-    } catch (err) {
-      console.error("Save error:", err);
-    }
+    // Отправка
+    await setDoc(doc(db, 'projects', 'soundpool', 'sessions', appId), {
+      votes: { [myName]: newVotes }
+    }, { merge: true });
   };
 
-  // 4. ИТОГИ
+  // Подсчет итогов
   const results = useMemo(() => {
     const counts = {};
     TRACKS.forEach(t => counts[t.id] = 0);
-
-    Object.values(cloudData.votes).forEach(userVotes => {
-      if (Array.isArray(userVotes)) {
-        userVotes.forEach(id => {
-          if (counts[id] !== undefined) counts[id]++;
-        });
-      }
+    Object.values(cloudData.votes).forEach(votes => {
+      if (Array.isArray(votes)) votes.forEach(id => { if (counts[id] !== undefined) counts[id]++ });
     });
-
-    return TRACKS
-      .map(t => ({ ...t, count: counts[t.id] }))
-      .sort((a, b) => b.count - a.count);
+    return TRACKS.map(t => ({ ...t, count: counts[t.id] })).sort((a, b) => b.count - a.count);
   }, [cloudData]);
 
-  // --- РЕНДЕР ---
+  // --- UI КОМПОНЕНТЫ ---
 
-  if (error) {
-    return (
-      <div className="min-h-screen bg-black flex flex-col items-center justify-center p-6 text-red-500 font-sans text-center">
-        <WifiOff size={48} className="mb-4" />
-        <h2 className="text-xl font-bold mb-2">Ошибка</h2>
-        <p className="text-sm opacity-80">{error}</p>
-      </div>
-    );
-  }
+  if (error) return <div className="min-h-screen bg-black flex items-center justify-center text-red-500">{error}</div>;
+  if (!isAuthReady) return <div className="min-h-screen bg-black flex items-center justify-center text-orange-500"><Loader2 className="animate-spin" /></div>;
 
-  // Показываем лоадер ТОЛЬКО пока идет авторизация (это быстро)
-  // Данные могут грузиться фоном
-  if (!isAuthReady) {
-    return (
-      <div className="min-h-screen bg-black flex items-center justify-center text-orange-600">
-        <Loader2 className="animate-spin" size={48} />
-      </div>
-    );
-  }
-
-  // ЭКРАН 1: ВЫБОР
+  // Экран 1: Выбор персоны
   if (!selectedPersona) {
     return (
-      <div className="min-h-screen bg-black text-white p-6 font-sans flex flex-col justify-center max-w-md mx-auto">
+      <div className="min-h-screen bg-black text-white p-6 flex flex-col justify-center max-w-md mx-auto">
         <div className="text-center mb-10">
-          <div className="w-20 h-20 bg-gradient-to-br from-orange-600 to-red-600 rounded-3xl mx-auto flex items-center justify-center mb-6 shadow-2xl shadow-orange-900/50">
-            <Music size={40} className="text-white" />
+          <div className="w-16 h-16 bg-orange-600 rounded-2xl mx-auto flex items-center justify-center mb-4">
+            <Music size={32} className="text-white" />
           </div>
-          <h1 className="text-3xl font-bold mb-2">SoundPool Online</h1>
-          <p className="text-zinc-500">
-            {isDataReady ? "Выберите себя:" : "Соединение с сервером..."}
-          </p>
+          <h1 className="text-2xl font-bold">SoundPool</h1>
+          <p className="text-zinc-500">Кто вы?</p>
         </div>
-
         <div className="space-y-3">
-          {PERSONAS.map(name => {
-            const votesCount = (cloudData.votes[name] || []).length;
-            return (
-              <button
-                key={name}
-                onClick={() => setSelectedPersona(name)}
-                className="w-full p-5 bg-zinc-900 hover:bg-zinc-800 border border-zinc-800 hover:border-orange-500/50 rounded-2xl text-left transition-all group relative overflow-hidden"
-              >
-                <div className="flex justify-between items-center relative z-10">
-                  <span className="font-bold text-lg group-hover:text-orange-400 transition-colors">{name}</span>
-                  
-                  {isDataReady ? (
-                    votesCount > 0 && (
-                      <span className="text-xs font-mono bg-zinc-800 px-2 py-1 rounded text-zinc-400 animate-in fade-in">
-                        {votesCount} выбрано
-                      </span>
-                    )
-                  ) : (
-                    <Loader2 size={16} className="text-zinc-600 animate-spin" />
-                  )}
-                </div>
-              </button>
-            );
-          })}
+          {PERSONAS.map(p => (
+            <button key={p.name} onClick={() => setSelectedPersona(p)} className="w-full p-4 bg-zinc-900 border border-zinc-800 rounded-xl text-left hover:border-orange-500 transition-colors flex items-center justify-between group">
+              <span className="font-bold">{p.name}</span>
+              <span className={`text-xs ${p.color} text-white px-2 py-1 rounded opacity-0 group-hover:opacity-100 transition-opacity`}>{p.initials}</span>
+            </button>
+          ))}
         </div>
       </div>
     );
   }
 
-  // ЭКРАН 2: ГОЛОСОВАНИЕ
-  const myVotes = cloudData.votes[selectedPersona] || [];
-  const totalVotes = Object.values(cloudData.votes).flat().length;
-
-  return (
-    <div className="min-h-screen bg-black text-white font-sans flex flex-col">
-      <div className="sticky top-0 z-50 bg-black/90 backdrop-blur-md border-b border-zinc-900 px-4 py-3 flex justify-between items-center">
-        <div className="flex items-center gap-3">
-          <div className="w-8 h-8 rounded-full bg-orange-600 flex items-center justify-center text-xs font-bold shadow-lg shadow-orange-900/50">
-            {selectedPersona.split(' ')[0][0]}
-          </div>
-          <div className="leading-tight">
-            <div className="font-bold text-sm">{selectedPersona}</div>
-            <div className="text-[10px] text-green-500 flex items-center gap-1">
-              <Zap size={10} fill="currentColor" /> Online
-            </div>
-          </div>
+  // Экран 2: Результаты
+  if (view === 'results') {
+    return (
+      <div className="min-h-screen bg-black text-white p-4 pb-24 font-sans max-w-md mx-auto">
+        <div className="text-center py-6">
+          <Trophy className="w-16 h-16 text-yellow-500 mx-auto mb-4 animate-bounce" />
+          <h2 className="text-3xl font-bold">Итоги</h2>
+          <p className="text-zinc-500">Рейтинг треков</p>
         </div>
+
+        <div className="space-y-4">
+          {results.slice(0, 10).map((track, idx) => (
+            track.count > 0 && (
+              <div key={track.id} className="bg-zinc-900/50 rounded-xl p-4 border border-zinc-800">
+                <div className="flex justify-between items-center mb-2">
+                  <div className="flex items-center gap-3">
+                    <span className={`text-xl font-bold ${idx === 0 ? 'text-yellow-400' : idx === 1 ? 'text-gray-300' : idx === 2 ? 'text-orange-400' : 'text-zinc-600'}`}>
+                      #{idx + 1}
+                    </span>
+                    <span className="font-medium">{track.title}</span>
+                  </div>
+                  <span className="text-xl font-bold">{track.count}</span>
+                </div>
+                
+                {/* Кто проголосовал */}
+                <div className="flex gap-2 mt-2">
+                  {PERSONAS.map(p => {
+                    if (cloudData.votes[p.name]?.includes(track.id)) {
+                      return (
+                        <div key={p.name} className={`px-2 py-0.5 rounded text-[10px] font-bold text-white ${p.color}`}>
+                          {p.name.split(' ')[0]}
+                        </div>
+                      )
+                    }
+                    return null;
+                  })}
+                </div>
+              </div>
+            )
+          ))}
+          {results[0].count === 0 && <p className="text-center text-zinc-600">Голосов пока нет</p>}
+        </div>
+
         <button 
-          onClick={() => setSelectedPersona(null)}
-          className="bg-zinc-900 px-3 py-1.5 rounded-lg text-xs font-medium text-zinc-400 hover:text-white transition-colors"
+          onClick={() => setView('voting')}
+          className="fixed bottom-6 left-4 right-4 bg-zinc-800 text-white py-4 rounded-xl font-bold flex items-center justify-center gap-2 hover:bg-zinc-700 transition-colors max-w-md mx-auto"
         >
-          Выйти
+          <RotateCcw size={20} />
+          Вернуться к выбору
         </button>
       </div>
+    );
+  }
 
-      <div className="flex-1 overflow-y-auto p-4 max-w-md mx-auto w-full pb-24">
-        
-        {/* Статистика сверху */}
-        <div className="grid grid-cols-3 gap-2 mb-6">
-           {PERSONAS.map(p => {
-             const count = (cloudData.votes[p] || []).length;
-             const isMe = p === selectedPersona;
-             return (
-               <div key={p} className={`bg-zinc-900/50 rounded-xl p-3 border text-center transition-all ${isMe ? 'border-orange-500/30 bg-orange-500/5' : 'border-zinc-800'}`}>
-                 <div className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1 truncate">{p.split(' ')[0]}</div>
-                 <div className="text-xl font-bold h-7 flex items-center justify-center">
-                   {isDataReady ? (
-                     <span className={count > 0 ? 'text-white' : 'text-zinc-700'}>{count}</span>
-                   ) : (
-                     <div className="w-4 h-4 rounded-full border-2 border-zinc-700 border-t-zinc-500 animate-spin" />
-                   )}
-                 </div>
-               </div>
-             )
-           })}
+  // Экран 3: Голосование (Основной)
+  const myVotes = cloudData.votes[selectedPersona.name] || [];
+  const votesCount = myVotes.length;
+
+  return (
+    <div className="min-h-screen bg-black text-white font-sans flex flex-col max-w-md mx-auto">
+      {/* Шапка */}
+      <div className="sticky top-0 z-20 bg-black/90 backdrop-blur border-b border-zinc-900 p-4 flex justify-between items-center">
+        <div className="flex items-center gap-3">
+          <div className={`w-8 h-8 rounded-full ${selectedPersona.color} flex items-center justify-center font-bold text-xs`}>
+            {selectedPersona.initials}
+          </div>
+          <div>
+            <div className="font-bold text-sm">{selectedPersona.name}</div>
+            <div className="text-[10px] text-green-500 flex items-center gap-1"><Zap size={10} /> Online</div>
+          </div>
+        </div>
+        <div className="text-xs text-zinc-500">Выбрано: <span className="text-white font-bold">{votesCount}</span></div>
+      </div>
+
+      {/* Список */}
+      <div className="flex-1 p-4 pb-32 overflow-y-auto">
+        <div className="flex items-center gap-2 mb-4 text-zinc-500 text-xs uppercase tracking-wider">
+           <Users size={12} />
+           <span>Выбор участников</span>
         </div>
 
-        <h2 className="text-lg font-bold mb-4 flex items-center gap-2">
-          <span className="text-orange-500">#</span> Треклист
-        </h2>
-
-        <div className="space-y-2 mb-8">
+        <div className="space-y-2">
           {TRACKS.map(track => {
             const isSelected = myVotes.includes(track.id);
+            
+            // Кто ЕЩЕ выбрал этот трек (кроме меня)
+            const othersWhoVoted = PERSONAS.filter(p => 
+              p.name !== selectedPersona.name && 
+              cloudData.votes[p.name]?.includes(track.id)
+            );
+
             return (
-              <button
+              <div 
                 key={track.id}
                 onClick={() => handleToggleVote(track.id)}
-                className={`w-full text-left p-4 rounded-xl border transition-all duration-200 flex items-center gap-4 group ${
+                className={`relative p-4 rounded-xl border transition-all cursor-pointer ${
                   isSelected 
-                    ? 'bg-orange-600 text-white border-orange-500 shadow-lg shadow-orange-900/40' 
-                    : 'bg-zinc-900 text-zinc-400 border-zinc-800 hover:bg-zinc-800'
+                    ? 'bg-orange-600/10 border-orange-500' 
+                    : 'bg-zinc-900 border-zinc-800'
                 }`}
               >
-                <div className={`w-6 h-6 rounded-md flex items-center justify-center border-2 transition-all flex-shrink-0 ${
-                  isSelected 
-                    ? 'border-white bg-white text-orange-600' 
-                    : 'border-zinc-700 group-hover:border-zinc-500 bg-transparent'
-                }`}>
-                  {isSelected && <Check size={16} strokeWidth={4} />}
+                <div className="flex items-start justify-between gap-3">
+                  <div className="flex-1">
+                    <div className={`font-medium text-sm mb-2 ${isSelected ? 'text-orange-400' : 'text-zinc-300'}`}>
+                      {track.title}
+                    </div>
+                    
+                    {/* Визуализация чужих голосов */}
+                    {othersWhoVoted.length > 0 && (
+                      <div className="flex gap-1">
+                        {othersWhoVoted.map(p => (
+                          <div key={p.name} className={`w-5 h-5 rounded-full ${p.color} flex items-center justify-center text-[8px] font-bold border border-black`}>
+                            {p.initials}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Мой выбор (Галочка) */}
+                  <div className={`w-6 h-6 rounded flex items-center justify-center border transition-colors ${
+                    isSelected ? 'bg-orange-500 border-orange-500 text-white' : 'border-zinc-700'
+                  }`}>
+                    {isSelected && <Check size={14} strokeWidth={4} />}
+                  </div>
                 </div>
-                <span className={`font-medium text-sm ${isSelected ? 'text-white' : 'text-zinc-300'}`}>
-                  {track.title}
-                </span>
-              </button>
+              </div>
             );
           })}
         </div>
+      </div>
 
-        {totalVotes > 0 && isDataReady && (
-          <div className="bg-zinc-900 rounded-2xl p-5 border border-zinc-800 animate-in fade-in slide-in-from-bottom-4 duration-500">
-            <h3 className="font-bold text-lg mb-4 flex items-center gap-2 text-white">
-              <Trophy className="text-yellow-500" size={20} />
-              Лидеры
-            </h3>
-            <div className="space-y-4">
-              {results.slice(0, 5).map((track, i) => (
-                track.count > 0 && (
-                  <div key={track.id} className="relative">
-                    <div className="flex justify-between text-sm mb-1.5 z-10 relative">
-                      <span className={`font-medium ${i === 0 ? 'text-yellow-400' : 'text-zinc-300'}`}>
-                        {i + 1}. {track.title}
-                      </span>
-                      <span className="font-bold">{track.count}</span>
-                    </div>
-                    <div className="h-2 w-full bg-zinc-800 rounded-full overflow-hidden">
-                      <div 
-                        className={`h-full rounded-full transition-all duration-500 ${i === 0 ? 'bg-yellow-500' : 'bg-orange-600'}`}
-                        style={{ width: `${(track.count / 3) * 100}%` }}
-                      />
-                    </div>
-                    <div className="flex gap-1 mt-1.5">
-                      {PERSONAS.map((p, idx) => {
-                        if (cloudData.votes[p]?.includes(track.id)) {
-                           return (
-                             <div key={idx} title={p} className="text-[9px] bg-zinc-800 px-1.5 py-0.5 rounded text-zinc-400 border border-zinc-700">
-                               {p.split(' ')[0]}
-                             </div>
-                           )
-                        }
-                        return null;
-                      })}
-                    </div>
-                  </div>
-                )
-              ))}
-            </div>
-          </div>
-        )}
+      {/* Кнопка завершения */}
+      <div className="fixed bottom-0 left-0 right-0 p-4 bg-gradient-to-t from-black via-black to-transparent max-w-md mx-auto">
+        <button 
+          onClick={() => setView('results')}
+          className="w-full py-4 bg-white text-black rounded-xl font-bold text-lg hover:bg-zinc-200 transition-colors shadow-lg shadow-white/10 flex items-center justify-center gap-2"
+        >
+          Завершить и смотреть итоги
+          <ArrowRight size={20} />
+        </button>
       </div>
     </div>
   );
 }
+
+
